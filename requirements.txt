@@ -1,697 +1,415 @@
-"""
-WSTT Dashboard — Streamlit v1.0
-Interface web para controle e monitoramento da coleta WSTT (Omnilink) -> Supabase
-"""
+"""Geração dos PDFs de documentação (usuário e técnica)."""
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-import threading
-from collections import deque
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
-import requests
-import streamlit as st
-import plotly.graph_objects as go
-import pandas as pd
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-# --- constants ---
-ROOT          = Path(__file__).resolve().parent
-COLLECTOR     = ROOT / "wstt_to_supabase.py"
-LOGO_PATH     = ROOT / "static" / "cargoblue.png"
-OMNI_PATH     = ROOT / "static" / "omnilink.png"
-ICON_PATH     = ROOT / "static" / "icon.png"
-
-SUPABASE_URL  = (os.getenv("SUPABASE_URL") or "").rstrip("/")
-SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_KEY") or ""
-DASH_USER     = (os.getenv("DASHBOARD_USER") or "Admin").strip()
-DASH_PASSWORD = os.getenv("DASHBOARD_PASSWORD") or ""
-INTERVAL_MIN  = int(os.getenv("WSTT_INTERVAL_MIN", "60"))
-
-# --- Supabase helpers ---
-def _req(endpoint: str, timeout: int = 20):
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return {"erro": "SUPABASE_URL / SUPABASE_SERVICE_KEY nao configurados"}
-    url = f"{SUPABASE_URL}/rest/v1/{endpoint}"
-    headers = {
-        "apikey":        SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type":  "application/json",
-        "Accept":        "application/json",
-    }
-    try:
-        r = requests.get(url, headers=headers, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except requests.RequestException as e:
-        return {"erro": str(e)}
-
-
-def fetch_executions(limit: int = 20) -> list:
-    result = _req(f"wstt_execucoes?select=*&order=iniciado_em.desc&limit={limit}", 10)
-    if isinstance(result, dict) and "erro" in result:
-        return [result]
-    return result if isinstance(result, list) else []
-
-
-def fetch_kpis(days: int = 30) -> dict:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return {"sem_config": True}
-    try:
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        veh_r = _req("wstt_veiculos?select=placa", 10)
-        total_veic = len(veh_r) if isinstance(veh_r, list) else 0
-
-        vv = _req(
-            f"wstt_viagens_telemetria?select=distancia_total_percorrida,consumo_total_litros,placa"
-            f"&data_inicio_viagem=gte.{since}", 20
-        )
-        total_viagens = 0
-        total_km      = 0.0
-        total_litros  = 0.0
-        if isinstance(vv, list):
-            total_viagens = len(vv)
-            for r in vv:
-                total_km     += float(r.get("distancia_total_percorrida") or 0)
-                total_litros += float(r.get("consumo_total_litros") or 0)
-
-        ev_url = (
-            f"{SUPABASE_URL}/rest/v1/wstt_eventos_tracker_telemetria"
-            f"?data_hora=gte.{since}&select=id"
-        )
-        ev_hdr = {
-            "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0",
-        }
-        try:
-            ev_resp = requests.get(ev_url, headers=ev_hdr, timeout=10)
-            cr = ev_resp.headers.get("Content-Range", "")
-            ev_count = int(cr.split("/")[-1]) if "/" in cr else 0
-        except Exception:
-            ev_count = 0
-
-        return {
-            "total_veiculos":  total_veic,
-            "total_viagens":   total_viagens,
-            "total_km":        round(total_km, 1),
-            "total_litros":    round(total_litros, 1),
-            "eventos_periodo": ev_count,
-            "periodo_dias":    days,
-        }
-    except Exception as e:
-        return {"erro": str(e)}
-
-
-def fetch_km_by_day(days: int = 30) -> list:
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    rows = _req(
-        f"wstt_viagens_telemetria?select=data_inicio_viagem,distancia_total_percorrida,placa"
-        f"&data_inicio_viagem=gte.{since}&order=data_inicio_viagem.asc&limit=5000", 30
-    )
-    if not isinstance(rows, list):
-        return []
-    bd: dict = {}
-    for r in rows:
-        raw = r.get("data_inicio_viagem", "")
-        if not raw:
-            continue
-        d = str(raw)[:10]
-        if d not in bd:
-            bd[d] = {"km": 0.0, "viagens": 0, "veiculos": set()}
-        bd[d]["km"]      += float(r.get("distancia_total_percorrida") or 0)
-        bd[d]["viagens"] += 1
-        if r.get("placa"):
-            bd[d]["veiculos"].add(r["placa"])
-    return [
-        {"data": d, "km": round(v["km"], 1), "viagens": v["viagens"],
-         "veiculos": len(v["veiculos"])}
-        for d, v in sorted(bd.items())
-    ]
-
-
-def fetch_recent_trips(limit: int = 50) -> list:
-    rows = _req(
-        f"wstt_viagens_telemetria?select=placa,data_inicio_viagem,data_fim_viagem,"
-        f"distancia_total_percorrida,consumo_total_litros,velocidade_media_considerada"
-        f"&order=data_inicio_viagem.desc&limit={limit}", 20
-    )
-    return rows if isinstance(rows, list) else []
-
-
-def fetch_top_vehicles(days: int = 30, limit: int = 10) -> list:
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    rows = _req(
-        f"wstt_viagens_telemetria?select=placa,distancia_total_percorrida,consumo_total_litros"
-        f"&data_inicio_viagem=gte.{since}&limit=5000", 30
-    )
-    if not isinstance(rows, list):
-        return []
-    agg: dict = {}
-    for r in rows:
-        p = r.get("placa") or "?"
-        if p not in agg:
-            agg[p] = {"placa": p, "km": 0.0, "litros": 0.0, "viagens": 0}
-        agg[p]["km"]      += float(r.get("distancia_total_percorrida") or 0)
-        agg[p]["litros"]  += float(r.get("consumo_total_litros") or 0)
-        agg[p]["viagens"] += 1
-    return sorted(agg.values(), key=lambda x: x["km"], reverse=True)[:limit]
-
-
-def fetch_table_counts() -> dict:
-    tables = [
-        "wstt_veiculos", "wstt_dados_historico_telemetria",
-        "wstt_viagens_telemetria", "wstt_viagens_telemetria_eletrico",
-        "wstt_eventos_tracker_telemetria", "wstt_eventos_tracker_telemetria2",
-        "wstt_execucoes",
-    ]
-    counts = {}
-    for t in tables:
-        try:
-            url = f"{SUPABASE_URL}/rest/v1/{t}?select=id"
-            hdr = {
-                "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0",
-            }
-            r = requests.get(url, headers=hdr, timeout=8)
-            cr = r.headers.get("Content-Range", "")
-            counts[t] = int(cr.split("/")[-1]) if "/" in cr else "?"
-        except Exception:
-            counts[t] = "?"
-    return counts
-
-
-# --- collector subprocess ---
-_collector_lock = threading.Lock()
-_log_deque: deque = deque(maxlen=500)
-
-
-def _is_running() -> bool:
-    proc = st.session_state.get("collector_proc")
-    if proc is None:
-        return False
-    return proc.poll() is None
-
-
-def start_collector() -> None:
-    with _collector_lock:
-        if _is_running():
-            return
-        env = os.environ.copy()
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["PYTHONUTF8"]       = "1"
-        try:
-            proc = subprocess.Popen(
-                [sys.executable, str(COLLECTOR)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=env,
-                bufsize=1,
-            )
-            st.session_state["collector_proc"]     = proc
-            st.session_state["collector_started"]  = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            st.session_state["collector_status"]   = "running"
-            _log_deque.clear()
-            _log_deque.append(f"[{_ts()}] [run] Coletor iniciado (PID {proc.pid})")
-
-            def _drain():
-                for line in proc.stdout:
-                    _log_deque.append(f"[{_ts()}] {line.rstrip()}")
-                rc = proc.wait()
-                st.session_state["collector_status"]   = "ok" if rc == 0 else "erro"
-                st.session_state["collector_finished"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                _log_deque.append(
-                    f"[{_ts()}] [{'ok' if rc == 0 else 'error'}] Coletor encerrado (rc={rc})"
-                )
-
-            threading.Thread(target=_drain, daemon=True).start()
-        except Exception as e:
-            _log_deque.append(f"[{_ts()}] [error] Falha ao iniciar coletor: {e}")
-
-
-def stop_collector() -> None:
-    proc = st.session_state.get("collector_proc")
-    if proc and proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        st.session_state["collector_status"] = "parado"
-        _log_deque.append(f"[{_ts()}] [warn] Coletor interrompido pelo usuario")
-
-
-def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%H:%M:%S")
-
-
-# --- page config ---
-st.set_page_config(
-    page_title="WSTT Dashboard",
-    page_icon=str(ICON_PATH) if ICON_PATH.exists() else "🚚",
-    layout="wide",
-    initial_sidebar_state="expanded",
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_LEFT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    Image,
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
 )
 
-# --- CSS global ---
-st.markdown("""
-<style>
-#MainMenu {visibility:hidden;}
-header {visibility:hidden;}
-footer {visibility:hidden;}
-.stApp {background:#060F1E;}
-[data-testid="stSidebar"] {background:#081526 !important; border-right:1px solid #1A3456;}
-[data-testid="stMetric"] {background:#0D1E33; border:1px solid #1A3456; border-radius:10px; padding:16px 20px;}
-[data-testid="stMetricLabel"] {color:#8BAAC8 !important; font-size:11px !important; text-transform:uppercase; letter-spacing:0.5px;}
-[data-testid="stMetricValue"] {color:#F0F6FF !important; font-size:26px !important; font-weight:700;}
-.stButton > button {background:#4F9EFF !important; color:white !important; border:none !important; border-radius:8px !important; font-weight:600 !important;}
-.stButton > button:hover {background:#3B8FEF !important;}
-.log-box {background:#060F1E; border:1px solid #1A3456; border-radius:8px; padding:14px 16px; font-family:'Courier New',monospace; font-size:12px; color:#8BAAC8; height:260px; overflow-y:auto; white-space:pre-wrap; word-break:break-all;}
-.pill-ok   {background:#065F46;color:#10D97E;border-radius:20px;padding:3px 12px;font-size:11px;font-weight:700;}
-.pill-erro {background:#7F1D2A;color:#FF4D6A;border-radius:20px;padding:3px 12px;font-size:11px;font-weight:700;}
-.pill-run  {background:#1A4D8A;color:#4F9EFF;border-radius:20px;padding:3px 12px;font-size:11px;font-weight:700;}
-.section-header {color:#4F9EFF; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:1px; padding:4px 0; border-bottom:2px solid #1A3456; margin-bottom:12px;}
-.info-card {background:#0D1E33; border:1px solid #1A3456; border-radius:10px; padding:16px 20px; margin-bottom:8px;}
-</style>
-""", unsafe_allow_html=True)
+LOGO_PATH = Path(__file__).resolve().parent / "static" / "cargoblue.png"
 
-# --- session state defaults ---
-for key, default in [
-    ("authenticated", False),
-    ("collector_proc", None),
-    ("collector_status", "parado"),
-    ("collector_started", None),
-    ("collector_finished", None),
-]:
-    if key not in st.session_state:
-        st.session_state[key] = default
+BLUE = colors.HexColor("#1F6FEB")
+DARK = colors.HexColor("#0B1A2B")
+GREY = colors.HexColor("#5A6B85")
+LIGHT = colors.HexColor("#EEF3FB")
 
 
-# =================================================================
-#  LOGIN
-# =================================================================
-def login_page():
-    col_l, col_c, col_r = st.columns([1, 1.4, 1])
-    with col_c:
-        st.markdown("<br><br>", unsafe_allow_html=True)
-        if LOGO_PATH.exists():
-            st.image(str(LOGO_PATH), width=220)
-        else:
-            st.markdown("## WSTT Dashboard")
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown('<div class="section-header">ACESSO AO SISTEMA</div>', unsafe_allow_html=True)
-
-        with st.form("login_form"):
-            user = st.text_input("Usuario", placeholder="Admin")
-            pwd  = st.text_input("Senha",   placeholder="••••••••", type="password")
-            submitted = st.form_submit_button("Entrar", use_container_width=True)
-
-        if submitted:
-            if user.strip() == DASH_USER and pwd == DASH_PASSWORD:
-                st.session_state["authenticated"] = True
-                st.rerun()
-            else:
-                st.error("Usuario ou senha incorretos.")
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        if OMNI_PATH.exists():
-            st.image(str(OMNI_PATH), width=120)
-        st.caption("WSTT Dashboard v1.0  |  Omnilink + Supabase")
-
-
-# =================================================================
-#  SIDEBAR
-# =================================================================
-def sidebar() -> str:
-    with st.sidebar:
-        if LOGO_PATH.exists():
-            st.image(str(LOGO_PATH), width=160)
-        st.markdown("---")
-        nav = st.radio(
-            "Navegacao",
-            ["Painel", "Analytics", "Configuracoes", "Exportar SQL"],
-            label_visibility="collapsed",
-        )
-        st.markdown("---")
-
-        status  = st.session_state.get("collector_status", "parado")
-        running = _is_running()
-        if running:
-            st.markdown('<span class="pill-run">Em execucao</span>', unsafe_allow_html=True)
-        elif status == "ok":
-            st.markdown('<span class="pill-ok">Concluido</span>', unsafe_allow_html=True)
-        elif status == "erro":
-            st.markdown('<span class="pill-erro">Erro</span>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<span style="color:#3D6080;font-size:12px">Parado</span>', unsafe_allow_html=True)
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        if OMNI_PATH.exists():
-            st.image(str(OMNI_PATH), width=100)
-        st.markdown("---")
-        st.caption(f"WSTT Dashboard v1.0  |  {DASH_USER}")
-        if st.button("Sair", use_container_width=True):
-            st.session_state["authenticated"] = False
-            st.rerun()
-    return nav
+def _styles():
+    base = getSampleStyleSheet()
+    return {
+        "h1": ParagraphStyle("h1", parent=base["Heading1"],
+                             fontName="Helvetica-Bold", fontSize=22,
+                             textColor=DARK, spaceAfter=10, leading=26),
+        "h2": ParagraphStyle("h2", parent=base["Heading2"],
+                             fontName="Helvetica-Bold", fontSize=14,
+                             textColor=BLUE, spaceBefore=14, spaceAfter=6),
+        "h3": ParagraphStyle("h3", parent=base["Heading3"],
+                             fontName="Helvetica-Bold", fontSize=11.5,
+                             textColor=DARK, spaceBefore=8, spaceAfter=2),
+        "p":  ParagraphStyle("p", parent=base["BodyText"],
+                             fontName="Helvetica", fontSize=10.5,
+                             textColor=DARK, leading=15, spaceAfter=6,
+                             alignment=TA_LEFT),
+        "small": ParagraphStyle("small", parent=base["BodyText"],
+                                fontName="Helvetica", fontSize=9,
+                                textColor=GREY, leading=12),
+        "code": ParagraphStyle("code", parent=base["BodyText"],
+                               fontName="Courier", fontSize=9,
+                               textColor=DARK, backColor=LIGHT, leading=12,
+                               leftIndent=8, rightIndent=8,
+                               spaceBefore=4, spaceAfter=8,
+                               borderPadding=6),
+        "li": ParagraphStyle("li", parent=base["BodyText"],
+                             fontName="Helvetica", fontSize=10.5,
+                             textColor=DARK, leading=15,
+                             leftIndent=14, bulletIndent=2, spaceAfter=3),
+    }
 
 
-# =================================================================
-#  PAINEL
-# =================================================================
-def page_painel():
-    st.markdown('<div class="section-header">CONTROLE DO COLETOR</div>', unsafe_allow_html=True)
+def _header_footer(canvas, doc):
+    canvas.saveState()
+    w, h = A4
+    canvas.setFillColor(BLUE)
+    canvas.rect(0, h - 1.0 * cm, w, 1.0 * cm, fill=1, stroke=0)
+    canvas.setFillColor(colors.white)
+    canvas.setFont("Helvetica-Bold", 10)
+    canvas.drawString(2 * cm, h - 0.65 * cm, "CARGOBLUE  ·  WSTT Dashboard")
+    canvas.setFont("Helvetica", 8.5)
+    canvas.drawRightString(w - 2 * cm, h - 0.65 * cm,
+                           datetime.now().strftime("%d/%m/%Y"))
+    # rodapé
+    canvas.setFillColor(GREY)
+    canvas.setFont("Helvetica", 8)
+    canvas.drawString(2 * cm, 1.2 * cm, "dev: Lucas Vieira Ramos")
+    canvas.drawRightString(w - 2 * cm, 1.2 * cm, f"Página {doc.page}")
+    canvas.setStrokeColor(LIGHT)
+    canvas.line(2 * cm, 1.6 * cm, w - 2 * cm, 1.6 * cm)
+    canvas.restoreState()
 
-    running = _is_running()
-    c1, c2, c3, _ = st.columns([1, 1, 1, 3])
-    with c1:
-        if st.button("Iniciar Coletor", disabled=running, use_container_width=True):
-            start_collector()
-            st.rerun()
-    with c2:
-        if st.button("Parar", disabled=not running, use_container_width=True):
-            stop_collector()
-            st.rerun()
-    with c3:
-        if st.button("Rodar Agora", use_container_width=True):
-            start_collector()
-            st.rerun()
 
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    def _fmt(ts):
-        if not ts:
-            return "—"
+def _cover(title: str, subtitle: str, sty) -> list:
+    flow = []
+    if LOGO_PATH.exists():
         try:
-            return datetime.fromisoformat(ts).strftime("%d/%m  %H:%M:%S")
+            img = Image(str(LOGO_PATH), width=8 * cm, height=2.2 * cm)
+            img.hAlign = "LEFT"
+            flow.append(Spacer(1, 3 * cm))
+            flow.append(img)
         except Exception:
-            return str(ts)[:16]
-
-    s1, s2, s3 = st.columns(3)
-    status = st.session_state.get("collector_status", "parado")
-    with s1:
-        st.metric("Ultima Execucao", _fmt(st.session_state.get("collector_started")))
-    with s2:
-        st.metric("Concluida em",    _fmt(st.session_state.get("collector_finished")))
-    with s3:
-        lbl = {"ok": "OK", "erro": "ERRO", "running": "Executando", "parado": "—"}.get(status, status)
-        st.metric("Status", lbl)
-
-    st.markdown("---")
-    st.markdown('<div class="section-header">LOGS AO VIVO</div>', unsafe_allow_html=True)
-
-    logs = list(_log_deque)
-    log_text = "\n".join(logs[-80:]) if logs else "Nenhum log ainda. Inicie o coletor para ver os logs aqui."
-    st.markdown(f'<div class="log-box">{log_text}</div>', unsafe_allow_html=True)
-
-    if running:
-        st.caption("Coletor em execucao — recarregue a pagina para atualizar os logs")
-
-    st.markdown("---")
-    st.markdown('<div class="section-header">HISTORICO DE EXECUCOES</div>', unsafe_allow_html=True)
-
-    col_ref, _ = st.columns([1, 5])
-    with col_ref:
-        if st.button("Atualizar Historico"):
-            st.rerun()
-
-    rows = fetch_executions(20)
-    if rows and "erro" in rows[0]:
-        st.error(f"Erro ao carregar historico: {rows[0]['erro']}")
-    elif rows:
-        table_data = []
-        for r in rows:
-            c = r.get("contagens") or {}
-            st_val = r.get("status", "")
-            table_data.append({
-                "Inicio":    _fmt(r.get("iniciado_em")),
-                "Fim":       _fmt(r.get("finalizado_em")),
-                "Status":    st_val,
-                "Veiculos":  c.get("wstt_veiculos", "—"),
-                "Historico": c.get("wstt_dados_historico_telemetria", "—"),
-                "Viagens":   c.get("wstt_viagens_telemetria", "—"),
-                "Eletrico":  c.get("wstt_viagens_telemetria_eletrico", "—"),
-                "Eventos":   c.get("wstt_eventos_tracker_telemetria", "—"),
-                "Eventos2":  c.get("wstt_eventos_tracker_telemetria2", "—"),
-            })
-        st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
-    else:
-        st.info("Nenhuma execucao registrada ainda.")
+            pass
+    flow.append(Spacer(1, 1.4 * cm))
+    flow.append(Paragraph(title, sty["h1"]))
+    flow.append(Paragraph(subtitle, sty["small"]))
+    flow.append(Spacer(1, 0.6 * cm))
+    flow.append(Paragraph(
+        f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}", sty["small"]))
+    flow.append(PageBreak())
+    return flow
 
 
-# =================================================================
-#  ANALYTICS
-# =================================================================
-def page_analytics():
-    st.markdown('<div class="section-header">ANALYTICS — KPIs DA FROTA</div>', unsafe_allow_html=True)
-
-    col_days, _ = st.columns([1, 4])
-    with col_days:
-        days = st.selectbox("Periodo", [7, 15, 30, 60, 90], index=2,
-                            format_func=lambda d: f"Ultimos {d} dias")
-
-    with st.spinner("Carregando KPIs..."):
-        kpis = fetch_kpis(days)
-
-    if "sem_config" in kpis:
-        st.warning("Configure SUPABASE_URL e SUPABASE_SERVICE_KEY no arquivo .env")
-        return
-    if "erro" in kpis:
-        st.error(f"Erro ao carregar KPIs: {kpis['erro']}")
-        return
-
-    k1, k2, k3, k4, k5 = st.columns(5)
-    with k1:
-        st.metric("Veiculos na Frota",  f"{kpis.get('total_veiculos', 0):,}")
-    with k2:
-        st.metric("Viagens no Periodo", f"{kpis.get('total_viagens', 0):,}")
-    with k3:
-        st.metric("KM Percorridos",     f"{kpis.get('total_km', 0):,.0f} km")
-    with k4:
-        st.metric("Consumo Total",      f"{kpis.get('total_litros', 0):,.0f} L")
-    with k5:
-        st.metric("Eventos de Risco",   f"{kpis.get('eventos_periodo', 0):,}")
-
-    st.markdown("---")
-    st.markdown('<div class="section-header">KM PERCORRIDO POR DIA</div>', unsafe_allow_html=True)
-
-    with st.spinner("Carregando grafico..."):
-        km_data = fetch_km_by_day(days)
-
-    if km_data:
-        df_km = pd.DataFrame(km_data)
-        df_km["data"] = pd.to_datetime(df_km["data"])
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=df_km["data"], y=df_km["km"],
-            mode="lines+markers",
-            name="KM",
-            line=dict(color="#4F9EFF", width=2.5),
-            marker=dict(size=6, color="#4F9EFF"),
-            fill="tozeroy",
-            fillcolor="rgba(79,158,255,0.12)",
-        ))
-        fig.update_layout(
-            paper_bgcolor="#0D1E33",
-            plot_bgcolor="#060F1E",
-            font=dict(color="#F0F6FF", size=12),
-            xaxis=dict(gridcolor="#1A3456", showgrid=True, tickformat="%d/%m"),
-            yaxis=dict(gridcolor="#1A3456", showgrid=True, title="KM"),
-            margin=dict(l=0, r=0, t=10, b=0),
-            height=280,
-            showlegend=False,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        total_km_p  = df_km["km"].sum()
-        total_v_p   = df_km["viagens"].sum()
-        st.caption(f"Total: {total_km_p:,.0f} km  |  {len(df_km)} dias  |  {total_v_p:,} viagens")
-    else:
-        st.info("Sem dados de viagens para o periodo selecionado.")
-
-    st.markdown("---")
-    col_left, col_right = st.columns(2)
-
-    with col_left:
-        st.markdown('<div class="section-header">VIAGENS POR DIA</div>', unsafe_allow_html=True)
-        if km_data:
-            df_v = pd.DataFrame(km_data)
-            df_v["data"] = pd.to_datetime(df_v["data"])
-            fig2 = go.Figure(go.Bar(
-                x=df_v["data"], y=df_v["viagens"],
-                marker_color="#8B5CF6",
-            ))
-            fig2.update_layout(
-                paper_bgcolor="#0D1E33", plot_bgcolor="#060F1E",
-                font=dict(color="#F0F6FF", size=11),
-                xaxis=dict(gridcolor="#1A3456", tickformat="%d/%m"),
-                yaxis=dict(gridcolor="#1A3456", title="Viagens"),
-                margin=dict(l=0, r=0, t=10, b=0),
-                height=240, showlegend=False,
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("Sem dados.")
-
-    with col_right:
-        st.markdown('<div class="section-header">TOP 10 VEICULOS (KM)</div>', unsafe_allow_html=True)
-        with st.spinner("Carregando..."):
-            top_v = fetch_top_vehicles(days)
-        if top_v:
-            df_top = pd.DataFrame(top_v)
-            df_top.columns = ["Placa", "KM", "Litros", "Viagens"]
-            df_top["KM"]     = df_top["KM"].apply(lambda x: f"{x:,.1f}")
-            df_top["Litros"] = df_top["Litros"].apply(lambda x: f"{x:,.1f}")
-            st.dataframe(df_top, use_container_width=True, hide_index=True, height=240)
-        else:
-            st.info("Sem dados.")
-
-    st.markdown("---")
-    st.markdown('<div class="section-header">VIAGENS RECENTES</div>', unsafe_allow_html=True)
-
-    with st.spinner("Carregando viagens..."):
-        trips = fetch_recent_trips(50)
-
-    if trips:
-        df_t = pd.DataFrame(trips).rename(columns={
-            "placa":                        "Placa",
-            "data_inicio_viagem":           "Inicio",
-            "data_fim_viagem":              "Fim",
-            "distancia_total_percorrida":   "KM",
-            "consumo_total_litros":         "Litros",
-            "velocidade_media_considerada": "Vel. Media",
-        })
-        for col in ["Inicio", "Fim"]:
-            if col in df_t.columns:
-                df_t[col] = pd.to_datetime(df_t[col], errors="coerce").dt.strftime("%d/%m  %H:%M")
-        for col in ["KM", "Litros", "Vel. Media"]:
-            if col in df_t.columns:
-                df_t[col] = pd.to_numeric(df_t[col], errors="coerce").round(1)
-        st.dataframe(df_t, use_container_width=True, hide_index=True, height=400)
-    else:
-        st.info("Sem viagens registradas para o periodo selecionado.")
+def _li(text: str, sty) -> Paragraph:
+    return Paragraph(f"• {text}", sty["li"])
 
 
-# =================================================================
-#  CONFIGURACOES
-# =================================================================
-def page_config():
-    st.markdown('<div class="section-header">CONFIGURACOES</div>', unsafe_allow_html=True)
-
-    url_display = SUPABASE_URL if SUPABASE_URL else "Nao configurado"
-    key_display = ("*" * 8 + SUPABASE_KEY[-6:]) if len(SUPABASE_KEY) > 6 else "Nao configurado"
-
-    st.markdown('<div class="info-card">', unsafe_allow_html=True)
-    st.markdown(f"**Supabase URL:** `{url_display}`")
-    st.markdown(f"**Service Key:** `{key_display}`")
-    st.markdown(f"**Usuario Dashboard:** `{DASH_USER}`")
-    st.markdown(f"**Intervalo Padrao:** `{INTERVAL_MIN} min`")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown("---")
-    st.markdown('<div class="section-header">CONTAGEM DE REGISTROS POR TABELA</div>', unsafe_allow_html=True)
-
-    if st.button("Atualizar Contagens"):
-        with st.spinner("Consultando Supabase..."):
-            counts = fetch_table_counts()
-        df_c = pd.DataFrame([{"Tabela": k, "Registros": v} for k, v in counts.items()])
-        st.dataframe(df_c, use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-    st.markdown('<div class="section-header">COLETOR — AJUDA</div>', unsafe_allow_html=True)
-    st.code("""# Coleta manual
-python wstt_to_supabase.py
-
-# Modo agendado headless (servidor sem GUI)
-python scheduler.py
-
-# Periodo especifico
-python wstt_to_supabase.py --ano 2026 --mes 5
-python wstt_to_supabase.py --dias 7
-""", language="bash")
+def _table(rows: list[list[str]]) -> Table:
+    t = Table(rows, hAlign="LEFT", colWidths=[5.0 * cm, 11.0 * cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), BLUE),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9.5),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT]),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BOX", (0, 0), (-1, -1), 0.4, GREY),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, GREY),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    return t
 
 
-# =================================================================
-#  EXPORTAR SQL
-# =================================================================
-def page_export():
-    st.markdown('<div class="section-header">EXPORTAR SQL</div>', unsafe_allow_html=True)
-    st.markdown("Baixe o schema das tabelas WSTT para aplicar no Supabase ou migrar para outro banco.")
+def _build(content_builder, filename_hint: str) -> bytes:
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=2 * cm, rightMargin=2 * cm,
+                            topMargin=1.6 * cm, bottomMargin=2 * cm,
+                            title=filename_hint, author="Lucas Vieira Ramos")
+    sty = _styles()
+    doc.build(content_builder(sty),
+              onFirstPage=_header_footer, onLaterPages=_header_footer)
+    return buf.getvalue()
 
-    schema_path = ROOT / "supabase_schema.sql"
-    if schema_path.exists():
-        schema_sql = schema_path.read_text(encoding="utf-8")
-        st.download_button(
-            "Baixar Schema SQL",
-            data=schema_sql,
-            file_name=f"wstt_schema_{datetime.now().strftime('%Y%m%d')}.sql",
-            mime="text/plain",
-            use_container_width=False,
+
+# ───────────────────────── Documentação do Usuário ─────────────────────────
+
+def build_user_pdf() -> bytes:
+    def content(sty):
+        f = _cover(
+            "Manual do Usuário",
+            "Painel WSTT Dashboard — guia rápido para operação do dia a dia.",
+            sty,
         )
 
-        st.markdown("---")
-        st.markdown('<div class="section-header">EXPORTAR DADOS DO SUPABASE</div>', unsafe_allow_html=True)
-        tables = [
-            "wstt_veiculos", "wstt_viagens_telemetria",
-            "wstt_eventos_tracker_telemetria", "wstt_execucoes",
+        f += [Paragraph("1. O que é o painel", sty["h2"])]
+        f += [Paragraph(
+            "O <b>WSTT Dashboard</b> é a tela onde você liga, desliga e acompanha "
+            "a coleta automática de dados da frota WSTT (Omnilink) que abastece "
+            "o banco de dados usado pelo Power BI. Tudo roda em segundo plano "
+            "no servidor da Replit — você só usa o painel para controlar e ver "
+            "o que está acontecendo.", sty["p"])]
+
+        f += [Paragraph("2. Acesso", sty["h2"])]
+        f += [Paragraph(
+            "Ao abrir o painel, o navegador pede um <b>usuário</b> e uma "
+            "<b>senha</b>. São as credenciais cadastradas pela equipe técnica. "
+            "Se errar, basta atualizar a página e digitar de novo.", sty["p"])]
+
+        f += [Paragraph("3. Aba Painel", sty["h2"])]
+        f += [Paragraph("Tem três áreas principais:", sty["p"])]
+        f += [
+            _li("<b>Controle</b> — onde você define o intervalo (em minutos) "
+                "e os botões <b>Iniciar</b>, <b>Parar</b> e <b>Rodar agora</b>.", sty),
+            _li("<b>Logs ao vivo</b> — terminal preto que mostra cada passo da "
+                "coleta em tempo real.", sty),
+            _li("<b>Histórico</b> — tabela com as últimas execuções, mostrando "
+                "quantos registros foram gravados em cada tabela.", sty),
         ]
-        sel_table    = st.selectbox("Selecione a tabela", tables)
-        export_limit = st.number_input("Maximo de registros", min_value=100, max_value=50000,
-                                       value=1000, step=100)
 
-        if st.button("Exportar como CSV"):
-            with st.spinner("Baixando dados..."):
-                data = _req(f"{sel_table}?select=*&limit={export_limit}&order=id.desc")
-            if isinstance(data, list) and data:
-                df  = pd.DataFrame(data)
-                csv = df.to_csv(index=False)
-                st.download_button(
-                    f"Baixar {sel_table}.csv",
-                    data=csv,
-                    file_name=f"{sel_table}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                )
-                st.success(f"{len(df)} registros exportados.")
-            elif isinstance(data, dict) and "erro" in data:
-                st.error(f"Erro: {data['erro']}")
-            else:
-                st.warning("Nenhum dado encontrado.")
+        f += [Paragraph("4. Como funciona o agendamento", sty["h2"])]
+        f += [Paragraph(
+            "Quando você clica em <b>Iniciar</b>, o painel dispara uma coleta "
+            "imediatamente e depois repete a cada N minutos (padrão: 60). Você "
+            "pode parar a qualquer momento clicando em <b>Parar</b>. Se quiser "
+            "uma coleta avulsa fora do agendamento, clique em <b>Rodar agora</b>.",
+            sty["p"])]
 
-        st.markdown("---")
-        with st.expander("Visualizar Schema SQL"):
-            st.code(schema_sql, language="sql")
-    else:
-        st.warning("Arquivo supabase_schema.sql nao encontrado.")
+        f += [Paragraph("5. Indicadores de estado", sty["h2"])]
+        f += [_table([
+            ["Estado", "O que significa"],
+            ["Verde pulsando", "Agendador ligado, aguardando próxima execução."],
+            ["Azul pulsando", "Coleta em andamento agora."],
+            ["Cinza", "Agendador parado — nenhuma coleta vai rodar."],
+            ["Status OK", "A última coleta foi gravada sem erros."],
+            ["Status Erro", "A última coleta falhou — veja o terminal de logs."],
+        ])]
+        f += [Spacer(1, 0.4 * cm)]
+
+        f += [Paragraph("6. O que cada coluna do histórico significa", sty["h2"])]
+        f += [_table([
+            ["Coluna", "Conteúdo"],
+            ["Início / Fim", "Hora em que a coleta começou e terminou."],
+            ["Status", "OK = tudo certo, Erro = falhou."],
+            ["Coords", "Pontos de localização dos veículos."],
+            ["Pos", "Última posição conhecida de cada veículo."],
+            ["Eventos", "Total de eventos da frota no período."],
+            ["Viagens", "Viagens fechadas no período."],
+            ["Cercas", "Cercas eletrônicas cadastradas."],
+            ["Mensagens", "Mensagens enviadas para os veículos."],
+            ["Iscas", "Quantidade de iscas e seus eventos."],
+            ["Ocorr.", "Ocorrências abertas/fechadas."],
+        ])]
+
+        f += [PageBreak()]
+
+        f += [Paragraph("7. Aba Configurações", sty["h2"])]
+        f += [Paragraph(
+            "Aqui é onde a equipe técnica escolhe o destino dos dados (hoje "
+            "<b>Supabase</b>; futuramente <b>AWS RDS Postgres</b>) e define os "
+            "dados de conexão. Para o uso comum, você não precisa mexer nada.",
+            sty["p"])]
+
+        f += [Paragraph("8. Aba Exportar SQL", sty["h2"])]
+        f += [Paragraph(
+            "Gera um arquivo <b>.sql</b> com tudo o que está no banco hoje — "
+            "estrutura das tabelas e dados. Útil para backup, para enviar para "
+            "outro servidor ou para abrir em ferramentas externas.", sty["p"])]
+        f += [_li("<b>Baixar arquivo .sql</b>: estrutura + dados.", sty)]
+        f += [_li("<b>Só estrutura</b>: somente os comandos CREATE TABLE.", sty)]
+        f += [Paragraph(
+            "O download começa na hora; em bancos grandes pode demorar alguns "
+            "segundos para terminar.", sty["small"])]
+
+        f += [Paragraph("9. Dúvidas comuns", sty["h2"])]
+        f += [Paragraph("<b>O painel pode ficar fechado?</b>", sty["h3"])]
+        f += [Paragraph(
+            "Sim. O painel é só uma janela de visualização — a coleta continua "
+            "rodando no servidor mesmo com o navegador fechado.", sty["p"])]
+        f += [Paragraph("<b>E se eu fechar o computador?</b>", sty["h3"])]
+        f += [Paragraph(
+            "Como tudo roda no servidor da Replit, fechar o computador não "
+            "interfere. Para garantir 24×7, mesmo se o ambiente de "
+            "desenvolvimento dormir, o sistema deve ser publicado em produção "
+            "(Reserved VM).", sty["p"])]
+        f += [Paragraph("<b>Onde aparece o resultado da coleta?</b>", sty["h3"])]
+        f += [Paragraph(
+            "Direto no banco de dados, e de lá no Power BI. O painel só serve "
+            "para controlar e monitorar.", sty["p"])]
+        f += [Paragraph("<b>O que faço se der erro?</b>", sty["h3"])]
+        f += [Paragraph(
+            "Olhe o terminal de logs — a mensagem de erro fica destacada em "
+            "vermelho. Encaminhe a mensagem para a equipe técnica.", sty["p"])]
+
+        f += [Spacer(1, 1 * cm)]
+        f += [Paragraph(
+            "Em caso de dúvidas: dev — Lucas Vieira Ramos.", sty["small"])]
+        return f
+
+    return _build(content, "Manual do Usuário — WSTT Dashboard")
 
 
-# =================================================================
-#  MAIN
-# =================================================================
-def main():
-    if not st.session_state["authenticated"]:
-        login_page()
-        return
+# ───────────────────────── Documentação Técnica ─────────────────────────
 
-    nav = sidebar()
+def build_tech_pdf() -> bytes:
+    def content(sty):
+        f = _cover(
+            "Documentação Técnica",
+            "Arquitetura, instalação, operação e migração do WSTT Dashboard.",
+            sty,
+        )
 
-    if nav == "Painel":
-        page_painel()
-    elif nav == "Analytics":
-        page_analytics()
-    elif nav == "Configuracoes":
-        page_config()
-    elif nav == "Exportar SQL":
-        page_export()
+        f += [Paragraph("1. Visão geral", sty["h2"])]
+        f += [Paragraph(
+            "Sistema em Python que coleta dados do <b>WSTT (Omnilink)</b> via "
+            "SOAP, normaliza/tipa os campos e grava no <b>Supabase Postgres</b>. "
+            "Inclui um painel web (Flask) com Start/Stop, logs em streaming "
+            "(SSE), histórico, gerenciamento de configuração e exportação SQL.",
+            sty["p"])]
 
+        f += [Paragraph("2. Stack", sty["h2"])]
+        f += [_table([
+            ["Componente", "Tecnologia"],
+            ["Linguagem", "Python 3.11"],
+            ["Web", "Flask + Server-Sent Events"],
+            ["Coleta", "requests + xml.etree (SOAP cru)"],
+            ["Banco atual", "Supabase Postgres (REST PostgREST)"],
+            ["Banco futuro", "AWS RDS / Aurora Postgres"],
+            ["PDF", "ReportLab"],
+            ["Auth do painel", "HTTP Basic"],
+            ["Hospedagem", "Replit (dev) / Reserved VM (prod)"],
+        ])]
 
-if __name__ == "__main__":
-    main()
+        f += [Paragraph("3. Arquivos do projeto", sty["h2"])]
+        f += [_table([
+            ["Arquivo", "Função"],
+            ["scripts/python/dashboard.py", "Servidor Flask + agendador (Start/Stop)"],
+            ["scripts/python/wstt_to_supabase.py", "Coletor SOAP → Postgres (idempotente)"],
+            ["scripts/python/scheduler.py", "Modo headless (sem painel)"],
+            ["scripts/python/supabase_schema.sql", "DDL tipado (TIMESTAMP, NUMERIC, BOOL...)"],
+            ["scripts/python/docs_pdf.py", "Geração dos PDFs de documentação"],
+            ["scripts/python/templates/index.html", "Template do painel"],
+            ["scripts/python/static/app.css | app.js", "Front-end"],
+            ["scripts/python/.config.json", "Configuração persistida (backend escolhido)"],
+        ])]
+
+        f += [Paragraph("4. Variáveis de ambiente / Secrets", sty["h2"])]
+        f += [_table([
+            ["Chave", "Uso"],
+            ["WSTT_USUARIO", "Login da API SOAP do WSTT"],
+            ["WSTT_SENHA", "Senha da API SOAP do WSTT"],
+            ["SUPABASE_URL", "URL do projeto Supabase"],
+            ["SUPABASE_SERVICE_KEY", "JWT do service_role (escrita)"],
+            ["DASHBOARD_USER", "Usuário do painel (HTTP Basic)"],
+            ["DASHBOARD_PASSWORD", "Senha do painel"],
+            ["WSTT_INTERVAL_MIN", "Intervalo padrão do scheduler (default 60)"],
+            ["AWS_DB_PASSWORD", "Senha do Postgres no AWS (futuro)"],
+            ["PORT", "Porta do servidor Flask (default 5000)"],
+        ])]
+
+        f += [PageBreak()]
+
+        f += [Paragraph("5. Fluxo de coleta", sty["h2"])]
+        f += [_li("<b>Login SOAP</b> em <i>EfetuarLogon</i> retorna chave de sessão.", sty)]
+        f += [_li("<b>ListarVeiculos</b> traz a frota ativa (paginado).", sty)]
+        f += [_li(
+            "Para cada placa, o coletor chama os métodos relevantes "
+            "(coordenadas, viagens, ocioso, posições, eventos, cercas, "
+            "pontos de referência, motoristas, alvos, rotas, sensores, "
+            "histórico de transmissão, mensagens, iscas, eventos de iscas "
+            "e ocorrências).", sty)]
+        f += [_li(
+            "Os XMLs são reduzidos a <i>dicts</i> e passados por mapeadores "
+            "que normalizam nomes (case-insensitive, múltiplas variantes).", sty)]
+        f += [_li(
+            "Antes de enviar ao Postgres, cada linha passa pelo "
+            "<i>coerce_row(table, row)</i>, que aplica os tipos definidos em "
+            "<b>COLUMN_TYPES</b> (timestamp BR → ISO, vírgula decimal, bool "
+            "&quot;Ligada/Desligada&quot;, etc.).", sty)]
+        f += [_li(
+            "É calculado um <b>row_hash</b> (SHA-1 dos campos significativos). "
+            "O UPSERT usa <i>on_conflict=row_hash</i>, garantindo "
+            "idempotência: rodar duas vezes não duplica.", sty)]
+        f += [_li(
+            "Cada execução grava um resumo em <b>wstt_execucoes</b> com "
+            "início, fim, status e contagens por tabela.", sty)]
+
+        f += [Paragraph("6. Schema (resumo)", sty["h2"])]
+        f += [Paragraph(
+            "22 tabelas planas (sem JSON aninhado), prontas para Power BI. "
+            "Tipos principais:", sty["p"])]
+        f += [_table([
+            ["Tipo Postgres", "Para que serve"],
+            ["TIMESTAMP", "Datas vindas do WSTT (horário local Brasil)"],
+            ["TIMESTAMPTZ", "Carimbos do servidor (importado_em / capturado_em)"],
+            ["DATE", "Datas sem hora (validade CNH, períodos)"],
+            ["NUMERIC", "Números (km, litros, lat/lng, horas, RPM, etc.)"],
+            ["INTEGER", "Contagens inteiras (quantidades, intervalo de tx)"],
+            ["BOOLEAN", "Flags (ignição, ativo)"],
+            ["TEXT", "Identificadores e textos livres"],
+            ["row_hash UNIQUE", "Garante UPSERT idempotente"],
+        ])]
+
+        f += [Paragraph("7. Endpoints HTTP", sty["h2"])]
+        f += [_table([
+            ["Rota", "Função"],
+            ["GET /", "Renderiza o painel (HTML)"],
+            ["GET /api/status", "Estado do scheduler"],
+            ["POST /api/start", "Liga o scheduler (body: {interval_min})"],
+            ["POST /api/stop", "Para o scheduler"],
+            ["POST /api/run-now", "Dispara coleta avulsa"],
+            ["GET /api/logs", "Buffer atual de logs (JSON)"],
+            ["GET /api/logs/stream", "Stream SSE de logs em tempo real"],
+            ["GET /api/executions", "Últimas execuções (lê wstt_execucoes)"],
+            ["GET /api/config", "Lê .config.json"],
+            ["POST /api/config", "Atualiza backend e dados de conexão"],
+            ["GET /api/export.sql", "Stream de SQL (schema + dados)"],
+            ["GET /api/docs/user.pdf", "Manual do Usuário em PDF"],
+            ["GET /api/docs/tech.pdf", "Documentação Técnica em PDF"],
+        ])]
+
+        f += [PageBreak()]
+
+        f += [Paragraph("8. Operação", sty["h2"])]
+        f += [Paragraph("<b>Subir o painel</b>", sty["h3"])]
+        f += [Paragraph("Workflow Replit <b>WSTT Dashboard</b>:", sty["p"])]
+        f += [Paragraph("python scripts/python/dashboard.py", sty["code"])]
+        f += [Paragraph("<b>Modo headless (sem painel)</b>", sty["h3"])]
+        f += [Paragraph("python scripts/python/scheduler.py", sty["code"])]
+        f += [Paragraph("<b>Coleta única manual</b>", sty["h3"])]
+        f += [Paragraph(
+            "python scripts/python/wstt_to_supabase.py --apenas posicoes,rastreadores",
+            sty["code"])]
+
+        f += [Paragraph("9. Migração para AWS RDS Postgres", sty["h2"])]
+        f += [_li("Provisionar instância RDS Postgres (libera porta 5432 para o IP do servidor de coleta).", sty)]
+        f += [_li("Criar database e usuário com permissões CRUD em <i>public</i>.", sty)]
+        f += [_li("Na aba <b>Exportar SQL</b>, baixar o arquivo (schema + dados).", sty)]
+        f += [_li("Aplicar no AWS: <i>psql -h ... -U ... -d ... -f wstt_export_*.sql</i>.", sty)]
+        f += [_li("Adicionar o secret <b>AWS_DB_PASSWORD</b> no Replit.", sty)]
+        f += [_li("Aba <b>Configurações</b>: trocar para <b>AWS RDS Postgres</b>, preencher os campos, salvar.", sty)]
+        f += [_li("Próximo ciclo do scheduler já grava no AWS (após o switch ser ativado no coletor — psycopg2).", sty)]
+
+        f += [Paragraph("10. Segurança", sty["h2"])]
+        f += [_li("Painel atrás de HTTP Basic (hmac.compare_digest, anti-timing).", sty)]
+        f += [_li("Service key do Supabase nunca aparece no front-end — só no servidor.", sty)]
+        f += [_li("Senha do AWS deve ficar em secret, nunca no .config.json.", sty)]
+        f += [_li("Em produção, publicar como Reserved VM e configurar HTTPS automático do Replit Deployments.", sty)]
+
+        f += [Paragraph("11. Manutenção", sty["h2"])]
+        f += [_li("Adicionar nova etapa de coleta: criar mapeador em wstt_to_supabase.py, registrar em ALL_STEPS, adicionar tabela no SQL e tipos em COLUMN_TYPES.", sty)]
+        f += [_li("Mudar intervalo padrão: variável de ambiente WSTT_INTERVAL_MIN.", sty)]
+        f += [_li("Trocar credenciais do painel: editar secrets DASHBOARD_USER / DASHBOARD_PASSWORD e reiniciar o workflow.", sty)]
+        f += [_li("Logs ficam em buffer em memória (1500 linhas) e são reenviados via SSE para clientes recém-conectados.", sty)]
+
+        f += [Spacer(1, 0.6 * cm)]
+        f += [Paragraph(
+            "Documento mantido por Lucas Vieira Ramos.", sty["small"])]
+        return f
+
+    return _build(content, "Documentação Técnica — WSTT Dashboard")
