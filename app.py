@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-WSTT Dashboard - Streamlit v1.0
+WSTT Dashboard - Streamlit v2.0
 Interface web para controle e monitoramento da coleta WSTT (Omnilink) -> Supabase
 """
 from __future__ import annotations
@@ -68,10 +68,8 @@ def fetch_kpis(days: int = 30) -> dict:
         return {"sem_config": True}
     try:
         since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-
         veh_r = _req("wstt_veiculos?select=placa", 10)
         total_veic = len(veh_r) if isinstance(veh_r, list) else 0
-
         vv = _req(
             f"wstt_viagens_telemetria?select=distancia_total_percorrida,consumo_total_litros,placa"
             f"&data_inicio_viagem=gte.{since}", 20
@@ -84,7 +82,6 @@ def fetch_kpis(days: int = 30) -> dict:
             for r in vv:
                 total_km     += float(r.get("distancia_total_percorrida") or 0)
                 total_litros += float(r.get("consumo_total_litros") or 0)
-
         ev_url = (
             f"{SUPABASE_URL}/rest/v1/wstt_eventos_tracker_telemetria"
             f"?data_hora=gte.{since}&select=id"
@@ -99,7 +96,6 @@ def fetch_kpis(days: int = 30) -> dict:
             ev_count = int(cr.split("/")[-1]) if "/" in cr else 0
         except Exception:
             ev_count = 0
-
         return {
             "total_veiculos":  total_veic,
             "total_viagens":   total_viagens,
@@ -222,7 +218,7 @@ def start_collector() -> None:
             st.session_state["collector_started"]  = datetime.now(timezone.utc).isoformat(timespec="seconds")
             st.session_state["collector_status"]   = "running"
             _log_deque.clear()
-            _log_deque.append(f"[{_ts()}] [run] Coletor iniciado (PID {proc.pid})")
+            _log_deque.append(f"[{_ts()}] Coletor iniciado (PID {proc.pid})")
 
             def _drain():
                 for line in proc.stdout:
@@ -230,13 +226,11 @@ def start_collector() -> None:
                 rc = proc.wait()
                 st.session_state["collector_status"]   = "ok" if rc == 0 else "erro"
                 st.session_state["collector_finished"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                _log_deque.append(
-                    f"[{_ts()}] [{'ok' if rc == 0 else 'error'}] Coletor encerrado (rc={rc})"
-                )
+                _log_deque.append(f"[{_ts()}] Coletor encerrado com codigo {rc}")
 
             threading.Thread(target=_drain, daemon=True).start()
         except Exception as e:
-            _log_deque.append(f"[{_ts()}] [error] Falha ao iniciar coletor: {e}")
+            _log_deque.append(f"[{_ts()}] ERRO ao iniciar coletor: {e}")
 
 
 def stop_collector() -> None:
@@ -248,42 +242,274 @@ def stop_collector() -> None:
         except subprocess.TimeoutExpired:
             proc.kill()
         st.session_state["collector_status"] = "parado"
-        _log_deque.append(f"[{_ts()}] [warn] Coletor interrompido pelo usuario")
+        _log_deque.append(f"[{_ts()}] Coletor interrompido pelo usuario")
 
 
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 
-# --- page config ---
+def _fmt_ts(ts):
+    if not ts:
+        return "-"
+    try:
+        return datetime.fromisoformat(ts).strftime("%d/%m  %H:%M:%S")
+    except Exception:
+        return str(ts)[:16]
+
+
+# =================================================================
+#  PAGE CONFIG
+# =================================================================
 st.set_page_config(
     page_title="WSTT Dashboard",
-    page_icon=str(ICON_PATH) if ICON_PATH.exists() else "🚚",
+    page_icon="truck",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# --- CSS global ---
+# =================================================================
+#  CSS - PROFESSIONAL LIGHT THEME
+# =================================================================
 st.markdown("""
 <style>
-#MainMenu {visibility:hidden;}
-header {visibility:hidden;}
-footer {visibility:hidden;}
-.stApp {background:#060F1E;}
-[data-testid="stSidebar"] {background:#081526 !important; border-right:1px solid #1A3456;}
-[data-testid="stMetric"] {background:#0D1E33; border:1px solid #1A3456; border-radius:10px; padding:16px 20px;}
-[data-testid="stMetricLabel"] {color:#8BAAC8 !important; font-size:11px !important; text-transform:uppercase; letter-spacing:0.5px;}
-[data-testid="stMetricValue"] {color:#F0F6FF !important; font-size:26px !important; font-weight:700;}
-.stButton > button {background:#4F9EFF !important; color:white !important; border:none !important; border-radius:8px !important; font-weight:600 !important;}
-.stButton > button:hover {background:#3B8FEF !important;}
-.log-box {background:#060F1E; border:1px solid #1A3456; border-radius:8px; padding:14px 16px; font-family:'Courier New',monospace; font-size:12px; color:#8BAAC8; height:260px; overflow-y:auto; white-space:pre-wrap; word-break:break-all;}
-.pill-ok   {background:#065F46;color:#10D97E;border-radius:20px;padding:3px 12px;font-size:11px;font-weight:700;}
-.pill-erro {background:#7F1D2A;color:#FF4D6A;border-radius:20px;padding:3px 12px;font-size:11px;font-weight:700;}
-.pill-run  {background:#1A4D8A;color:#4F9EFF;border-radius:20px;padding:3px 12px;font-size:11px;font-weight:700;}
-.section-header {color:#4F9EFF; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:1px; padding:4px 0; border-bottom:2px solid #1A3456; margin-bottom:12px;}
-.info-card {background:#0D1E33; border:1px solid #1A3456; border-radius:10px; padding:16px 20px; margin-bottom:8px;}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+/* ---- Reset & base ---- */
+html, body, [class*="css"] {
+    font-family: 'Inter', 'Segoe UI', sans-serif;
+}
+#MainMenu, header, footer { visibility: hidden; }
+
+/* ---- Page background ---- */
+.stApp {
+    background: #F0F4F8;
+}
+
+/* ---- Sidebar ---- */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0F2544 0%, #163a6b 100%) !important;
+    border-right: none !important;
+    box-shadow: 4px 0 16px rgba(0,0,0,0.15);
+}
+[data-testid="stSidebar"] * {
+    color: #E2EAF4 !important;
+}
+[data-testid="stSidebar"] .stRadio label {
+    color: #B8CCEA !important;
+    font-size: 14px !important;
+    padding: 6px 4px !important;
+}
+[data-testid="stSidebar"] hr {
+    border-color: rgba(255,255,255,0.12) !important;
+}
+
+/* ---- Main content area ---- */
+[data-testid="stMainBlockContainer"],
+.main .block-container {
+    background: transparent;
+    padding: 1.5rem 2.5rem 2rem 2.5rem !important;
+    max-width: 1400px;
+}
+
+/* ---- Page title / section headers ---- */
+.page-title {
+    font-size: 22px;
+    font-weight: 700;
+    color: #0F2544;
+    margin-bottom: 4px;
+    letter-spacing: -0.3px;
+}
+.page-subtitle {
+    font-size: 13px;
+    color: #64748B;
+    margin-bottom: 24px;
+}
+.section-label {
+    font-size: 11px;
+    font-weight: 700;
+    color: #94A3B8;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    margin: 20px 0 10px 0;
+    padding-bottom: 6px;
+    border-bottom: 2px solid #E2E8F0;
+}
+
+/* ---- KPI Cards ---- */
+[data-testid="stMetric"] {
+    background: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: 12px;
+    padding: 20px 22px !important;
+    box-shadow: 0 1px 4px rgba(15,37,68,0.07);
+    transition: box-shadow 0.2s;
+}
+[data-testid="stMetric"]:hover {
+    box-shadow: 0 4px 16px rgba(15,37,68,0.12);
+}
+[data-testid="stMetricLabel"] {
+    color: #64748B !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.8px !important;
+}
+[data-testid="stMetricValue"] {
+    color: #0F2544 !important;
+    font-size: 28px !important;
+    font-weight: 700 !important;
+    letter-spacing: -0.5px !important;
+}
+
+/* ---- Buttons ---- */
+.stButton > button {
+    background: #1D4ED8 !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    font-size: 13px !important;
+    padding: 8px 20px !important;
+    letter-spacing: 0.2px !important;
+    transition: all 0.15s !important;
+    box-shadow: 0 1px 4px rgba(29,78,216,0.25) !important;
+}
+.stButton > button:hover {
+    background: #1E40AF !important;
+    box-shadow: 0 4px 12px rgba(29,78,216,0.35) !important;
+    transform: translateY(-1px) !important;
+}
+.stButton > button:active {
+    transform: translateY(0) !important;
+}
+
+/* ---- Selectbox / number input ---- */
+[data-testid="stSelectbox"] > div > div,
+[data-testid="stNumberInput"] > div > div > input {
+    background: #FFFFFF !important;
+    border: 1px solid #CBD5E1 !important;
+    border-radius: 8px !important;
+    color: #1E293B !important;
+    font-size: 13px !important;
+}
+
+/* ---- Dataframe ---- */
+[data-testid="stDataFrame"] {
+    border: 1px solid #E2E8F0 !important;
+    border-radius: 10px !important;
+    overflow: hidden !important;
+    box-shadow: 0 1px 4px rgba(15,37,68,0.05) !important;
+}
+
+/* ---- White card wrapper ---- */
+.card {
+    background: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: 12px;
+    padding: 20px 24px;
+    margin-bottom: 16px;
+    box-shadow: 0 1px 4px rgba(15,37,68,0.06);
+}
+
+/* ---- Status pills ---- */
+.pill {
+    display: inline-block;
+    border-radius: 20px;
+    padding: 4px 14px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+}
+.pill-ok    { background: #D1FAE5; color: #065F46; }
+.pill-erro  { background: #FEE2E2; color: #991B1B; }
+.pill-run   { background: #DBEAFE; color: #1E40AF; }
+.pill-parado{ background: #F1F5F9; color: #64748B; }
+
+/* ---- Log box ---- */
+.log-box {
+    background: #0F172A;
+    border: 1px solid #1E3A5F;
+    border-radius: 10px;
+    padding: 16px 18px;
+    font-family: 'Cascadia Code','Fira Code','Consolas',monospace;
+    font-size: 12px;
+    color: #94A3B8;
+    height: 240px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    line-height: 1.7;
+}
+
+/* ---- Stat row ---- */
+.stat-row {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 16px;
+}
+.stat-box {
+    flex: 1;
+    background: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: 10px;
+    padding: 14px 18px;
+    box-shadow: 0 1px 3px rgba(15,37,68,0.05);
+}
+.stat-label {
+    font-size: 10px;
+    color: #94A3B8;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 4px;
+}
+.stat-value {
+    font-size: 14px;
+    color: #0F2544;
+    font-weight: 700;
+}
+
+/* ---- Divider ---- */
+hr { border: none; border-top: 1px solid #E2E8F0; margin: 20px 0; }
+
+/* ---- Info / warning boxes ---- */
+.info-box {
+    background: #EFF6FF;
+    border-left: 4px solid #3B82F6;
+    border-radius: 0 8px 8px 0;
+    padding: 12px 16px;
+    font-size: 13px;
+    color: #1E40AF;
+    margin-bottom: 12px;
+}
+.warn-box {
+    background: #FFFBEB;
+    border-left: 4px solid #F59E0B;
+    border-radius: 0 8px 8px 0;
+    padding: 12px 16px;
+    font-size: 13px;
+    color: #92400E;
+}
+
+/* ---- Login card ---- */
+.login-wrap {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 80vh;
+}
+.login-card {
+    background: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: 16px;
+    padding: 40px 48px;
+    width: 420px;
+    box-shadow: 0 8px 32px rgba(15,37,68,0.12);
+}
 </style>
 """, unsafe_allow_html=True)
+
 
 # --- session state defaults ---
 for key, default in [
@@ -301,20 +527,22 @@ for key, default in [
 #  LOGIN
 # =================================================================
 def login_page():
-    col_l, col_c, col_r = st.columns([1, 1.4, 1])
-    with col_c:
+    _, col, _ = st.columns([1, 1.2, 1])
+    with col:
         st.markdown("<br><br>", unsafe_allow_html=True)
+
         if LOGO_PATH.exists():
-            st.image(str(LOGO_PATH), width=220)
+            st.image(str(LOGO_PATH), width=200)
         else:
-            st.markdown("## WSTT Dashboard")
+            st.markdown("### WSTT Dashboard")
 
         st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown('<div class="section-header">ACESSO AO SISTEMA</div>', unsafe_allow_html=True)
+        st.markdown('<p style="font-size:18px;font-weight:700;color:#0F2544;margin-bottom:4px;">Bem-vindo de volta</p>', unsafe_allow_html=True)
+        st.markdown('<p style="font-size:13px;color:#64748B;margin-bottom:20px;">Entre com suas credenciais para acessar o painel</p>', unsafe_allow_html=True)
 
         with st.form("login_form"):
             user = st.text_input("Usuario", placeholder="Admin")
-            pwd  = st.text_input("Senha",   placeholder="••••••••", type="password")
+            pwd  = st.text_input("Senha",   placeholder="Senha", type="password")
             submitted = st.form_submit_button("Entrar", use_container_width=True)
 
         if submitted:
@@ -326,8 +554,9 @@ def login_page():
 
         st.markdown("<br>", unsafe_allow_html=True)
         if OMNI_PATH.exists():
-            st.image(str(OMNI_PATH), width=120)
-        st.caption("WSTT Dashboard v1.0  |  Omnilink + Supabase")
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                st.image(str(OMNI_PATH), width=90)
 
 
 # =================================================================
@@ -335,35 +564,48 @@ def login_page():
 # =================================================================
 def sidebar() -> str:
     with st.sidebar:
+        st.markdown("<br>", unsafe_allow_html=True)
         if LOGO_PATH.exists():
-            st.image(str(LOGO_PATH), width=160)
+            st.image(str(LOGO_PATH), width=155)
+        else:
+            st.markdown("### WSTT Dashboard")
+
         st.markdown("---")
+
         nav = st.radio(
-            "Navegacao",
+            "Menu",
             ["Painel", "Analytics", "Configuracoes", "Exportar SQL"],
             label_visibility="collapsed",
         )
+
         st.markdown("---")
 
+        # Collector status
         status  = st.session_state.get("collector_status", "parado")
         running = _is_running()
+        st.markdown('<p style="font-size:10px;font-weight:700;color:#7A9CC4;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">Status do Coletor</p>', unsafe_allow_html=True)
         if running:
-            st.markdown('<span class="pill-run">Em execucao</span>', unsafe_allow_html=True)
+            st.markdown('<span class="pill pill-run">Em execucao</span>', unsafe_allow_html=True)
         elif status == "ok":
-            st.markdown('<span class="pill-ok">Concluido</span>', unsafe_allow_html=True)
+            st.markdown('<span class="pill pill-ok">Concluido com sucesso</span>', unsafe_allow_html=True)
         elif status == "erro":
-            st.markdown('<span class="pill-erro">Erro</span>', unsafe_allow_html=True)
+            st.markdown('<span class="pill pill-erro">Encerrado com erro</span>', unsafe_allow_html=True)
         else:
-            st.markdown(f'<span style="color:#3D6080;font-size:12px">Parado</span>', unsafe_allow_html=True)
+            st.markdown('<span class="pill pill-parado">Aguardando</span>', unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
+
         if OMNI_PATH.exists():
-            st.image(str(OMNI_PATH), width=100)
+            st.image(str(OMNI_PATH), width=90)
+
         st.markdown("---")
-        st.caption(f"WSTT Dashboard v1.0  |  {DASH_USER}")
+        st.markdown(f'<p style="font-size:11px;color:#7A9CC4;">Logado como <strong style="color:#B8CCEA;">{DASH_USER}</strong></p>', unsafe_allow_html=True)
+        st.markdown('<p style="font-size:11px;color:#7A9CC4;">WSTT Dashboard v2.0</p>', unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
         if st.button("Sair", use_container_width=True):
             st.session_state["authenticated"] = False
             st.rerun()
+
     return nav
 
 
@@ -371,121 +613,137 @@ def sidebar() -> str:
 #  PAINEL
 # =================================================================
 def page_painel():
-    st.markdown('<div class="section-header">CONTROLE DO COLETOR</div>', unsafe_allow_html=True)
+    st.markdown('<p class="page-title">Painel de Controle</p>', unsafe_allow_html=True)
+    st.markdown('<p class="page-subtitle">Gerencie a coleta de dados WSTT e acompanhe o historico de execucoes.</p>', unsafe_allow_html=True)
 
-    running = _is_running()
-    c1, c2, c3, _ = st.columns([1, 1, 1, 3])
-    with c1:
-        if st.button("Iniciar Coletor", disabled=running, use_container_width=True):
-            start_collector()
-            st.rerun()
-    with c2:
-        if st.button("Parar", disabled=not running, use_container_width=True):
-            stop_collector()
-            st.rerun()
-    with c3:
-        if st.button("Rodar Agora", use_container_width=True):
-            start_collector()
-            st.rerun()
+    # --- Collector control card ---
+    with st.container():
+        running = _is_running()
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 3])
+        with c1:
+            if st.button("Iniciar Coletor", disabled=running, use_container_width=True):
+                start_collector(); st.rerun()
+        with c2:
+            if st.button("Parar", disabled=not running, use_container_width=True):
+                stop_collector(); st.rerun()
+        with c3:
+            if st.button("Rodar Agora", use_container_width=True):
+                start_collector(); st.rerun()
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    def _fmt(ts):
-        if not ts:
-            return "—"
-        try:
-            return datetime.fromisoformat(ts).strftime("%d/%m  %H:%M:%S")
-        except Exception:
-            return str(ts)[:16]
-
-    s1, s2, s3 = st.columns(3)
+    # --- Stats row ---
     status = st.session_state.get("collector_status", "parado")
-    with s1:
-        st.metric("Ultima Execucao", _fmt(st.session_state.get("collector_started")))
-    with s2:
-        st.metric("Concluida em",    _fmt(st.session_state.get("collector_finished")))
-    with s3:
-        lbl = {"ok": "OK", "erro": "ERRO", "running": "Executando", "parado": "—"}.get(status, status)
-        st.metric("Status", lbl)
+    started  = _fmt_ts(st.session_state.get("collector_started"))
+    finished = _fmt_ts(st.session_state.get("collector_finished"))
+    status_label = {"ok": "Concluido com sucesso", "erro": "Encerrado com erro",
+                    "running": "Em execucao...", "parado": "Aguardando"}.get(status, status)
+    status_color = {"ok": "#065F46", "erro": "#991B1B",
+                    "running": "#1E40AF", "parado": "#64748B"}.get(status, "#64748B")
 
-    st.markdown("---")
-    st.markdown('<div class="section-header">LOGS AO VIVO</div>', unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="stat-row">
+      <div class="stat-box">
+        <div class="stat-label">Ultima Execucao</div>
+        <div class="stat-value">{started}</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Concluida em</div>
+        <div class="stat-value">{finished}</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Status</div>
+        <div class="stat-value" style="color:{status_color};">{status_label}</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
+    # --- Logs ---
+    st.markdown('<p class="section-label">Logs ao Vivo</p>', unsafe_allow_html=True)
     logs = list(_log_deque)
-    log_text = "\n".join(logs[-80:]) if logs else "Nenhum log ainda. Inicie o coletor para ver os logs aqui."
+    log_text = "\n".join(logs[-80:]) if logs else "Nenhum log ainda. Inicie o coletor para ver os registros aqui."
     st.markdown(f'<div class="log-box">{log_text}</div>', unsafe_allow_html=True)
-
     if running:
         st.caption("Coletor em execucao — recarregue a pagina para atualizar os logs")
 
-    st.markdown("---")
-    st.markdown('<div class="section-header">HISTORICO DE EXECUCOES</div>', unsafe_allow_html=True)
-
-    col_ref, _ = st.columns([1, 5])
+    # --- History ---
+    st.markdown('<p class="section-label">Historico de Execucoes</p>', unsafe_allow_html=True)
+    col_ref, _ = st.columns([1, 6])
     with col_ref:
-        if st.button("Atualizar Historico"):
+        if st.button("Atualizar"):
             st.rerun()
 
     rows = fetch_executions(20)
     if rows and "erro" in rows[0]:
-        st.error(f"Erro ao carregar historico: {rows[0]['erro']}")
+        st.markdown(f'<div class="warn-box">Erro ao carregar historico: {rows[0]["erro"]}</div>', unsafe_allow_html=True)
     elif rows:
         table_data = []
         for r in rows:
             c = r.get("contagens") or {}
-            st_val = r.get("status", "")
             table_data.append({
-                "Inicio":    _fmt(r.get("iniciado_em")),
-                "Fim":       _fmt(r.get("finalizado_em")),
-                "Status":    st_val,
-                "Veiculos":  c.get("wstt_veiculos", "—"),
-                "Historico": c.get("wstt_dados_historico_telemetria", "—"),
-                "Viagens":   c.get("wstt_viagens_telemetria", "—"),
-                "Eletrico":  c.get("wstt_viagens_telemetria_eletrico", "—"),
-                "Eventos":   c.get("wstt_eventos_tracker_telemetria", "—"),
-                "Eventos2":  c.get("wstt_eventos_tracker_telemetria2", "—"),
+                "Inicio":    _fmt_ts(r.get("iniciado_em")),
+                "Fim":       _fmt_ts(r.get("finalizado_em")),
+                "Status":    r.get("status", "-"),
+                "Veiculos":  c.get("wstt_veiculos", "-"),
+                "Historico": c.get("wstt_dados_historico_telemetria", "-"),
+                "Viagens":   c.get("wstt_viagens_telemetria", "-"),
+                "Eletrico":  c.get("wstt_viagens_telemetria_eletrico", "-"),
+                "Eventos":   c.get("wstt_eventos_tracker_telemetria", "-"),
             })
         st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
     else:
-        st.info("Nenhuma execucao registrada ainda.")
+        st.markdown('<div class="info-box">Nenhuma execucao registrada ainda. Inicie o coletor para comecar.</div>', unsafe_allow_html=True)
 
 
 # =================================================================
 #  ANALYTICS
 # =================================================================
 def page_analytics():
-    st.markdown('<div class="section-header">ANALYTICS — KPIs DA FROTA</div>', unsafe_allow_html=True)
+    st.markdown('<p class="page-title">Analytics</p>', unsafe_allow_html=True)
+    st.markdown('<p class="page-subtitle">KPIs e metricas da frota em tempo real a partir dos dados coletados.</p>', unsafe_allow_html=True)
 
-    col_days, _ = st.columns([1, 4])
+    col_days, _ = st.columns([1, 5])
     with col_days:
-        days = st.selectbox("Periodo", [7, 15, 30, 60, 90], index=2,
+        days = st.selectbox("Periodo de analise", [7, 15, 30, 60, 90], index=2,
                             format_func=lambda d: f"Ultimos {d} dias")
 
-    with st.spinner("Carregando KPIs..."):
+    with st.spinner("Carregando dados..."):
         kpis = fetch_kpis(days)
 
     if "sem_config" in kpis:
-        st.warning("Configure SUPABASE_URL e SUPABASE_SERVICE_KEY no arquivo .env")
+        st.markdown('<div class="warn-box">Configure SUPABASE_URL e SUPABASE_SERVICE_KEY nas variaveis de ambiente ou no arquivo .env</div>', unsafe_allow_html=True)
         return
     if "erro" in kpis:
         st.error(f"Erro ao carregar KPIs: {kpis['erro']}")
         return
 
+    # KPI row
+    st.markdown('<p class="section-label">Resumo do Periodo</p>', unsafe_allow_html=True)
     k1, k2, k3, k4, k5 = st.columns(5)
-    with k1:
-        st.metric("Veiculos na Frota",  f"{kpis.get('total_veiculos', 0):,}")
-    with k2:
-        st.metric("Viagens no Periodo", f"{kpis.get('total_viagens', 0):,}")
-    with k3:
-        st.metric("KM Percorridos",     f"{kpis.get('total_km', 0):,.0f} km")
-    with k4:
-        st.metric("Consumo Total",      f"{kpis.get('total_litros', 0):,.0f} L")
-    with k5:
-        st.metric("Eventos de Risco",   f"{kpis.get('eventos_periodo', 0):,}")
+    kpi_data = [
+        (k1, "Veiculos na Frota",  f"{kpis.get('total_veiculos', 0):,}",  "#3B82F6"),
+        (k2, "Viagens Realizadas", f"{kpis.get('total_viagens', 0):,}",   "#10B981"),
+        (k3, "KM Percorridos",     f"{kpis.get('total_km', 0):,.0f} km",  "#6366F1"),
+        (k4, "Consumo Total",      f"{kpis.get('total_litros', 0):,.0f} L","#F59E0B"),
+        (k5, "Eventos de Risco",   f"{kpis.get('eventos_periodo', 0):,}", "#EF4444"),
+    ]
+    for col, label, value, color in kpi_data:
+        with col:
+            st.markdown(f"""
+            <div style="background:#fff;border:1px solid #E2E8F0;border-top:3px solid {color};
+                        border-radius:10px;padding:18px 20px;
+                        box-shadow:0 1px 4px rgba(15,37,68,0.06);">
+              <p style="font-size:10px;font-weight:700;color:#94A3B8;text-transform:uppercase;
+                        letter-spacing:0.8px;margin:0 0 8px 0;">{label}</p>
+              <p style="font-size:26px;font-weight:700;color:#0F2544;
+                        letter-spacing:-0.5px;margin:0;">{value}</p>
+            </div>
+            """, unsafe_allow_html=True)
 
-    st.markdown("---")
-    st.markdown('<div class="section-header">KM PERCORRIDO POR DIA</div>', unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
 
+    # KM chart
+    st.markdown('<p class="section-label">KM Percorrido por Dia</p>', unsafe_allow_html=True)
     with st.spinner("Carregando grafico..."):
         km_data = fetch_km_by_day(days)
 
@@ -496,55 +754,69 @@ def page_analytics():
         fig.add_trace(go.Scatter(
             x=df_km["data"], y=df_km["km"],
             mode="lines+markers",
-            name="KM",
-            line=dict(color="#4F9EFF", width=2.5),
-            marker=dict(size=6, color="#4F9EFF"),
+            line=dict(color="#1D4ED8", width=2.5),
+            marker=dict(size=5, color="#1D4ED8", line=dict(width=1.5, color="white")),
             fill="tozeroy",
-            fillcolor="rgba(79,158,255,0.12)",
+            fillcolor="rgba(29,78,216,0.08)",
+            hovertemplate="<b>%{x|%d/%m/%Y}</b><br>KM: %{y:,.1f}<extra></extra>",
         ))
         fig.update_layout(
-            paper_bgcolor="#0D1E33",
-            plot_bgcolor="#060F1E",
-            font=dict(color="#F0F6FF", size=12),
-            xaxis=dict(gridcolor="#1A3456", showgrid=True, tickformat="%d/%m"),
-            yaxis=dict(gridcolor="#1A3456", showgrid=True, title="KM"),
-            margin=dict(l=0, r=0, t=10, b=0),
+            paper_bgcolor="#FFFFFF",
+            plot_bgcolor="#FAFBFD",
+            font=dict(family="Inter, sans-serif", color="#334155", size=12),
+            xaxis=dict(
+                gridcolor="#E2E8F0", showgrid=True, tickformat="%d/%m",
+                tickfont=dict(color="#94A3B8", size=11),
+                linecolor="#E2E8F0", zeroline=False,
+            ),
+            yaxis=dict(
+                gridcolor="#E2E8F0", showgrid=True, title="KM",
+                tickfont=dict(color="#94A3B8", size=11),
+                linecolor="#E2E8F0", zeroline=False,
+            ),
+            margin=dict(l=10, r=10, t=16, b=10),
             height=280,
             showlegend=False,
+            hovermode="x unified",
         )
-        st.plotly_chart(fig, use_container_width=True)
-        total_km_p  = df_km["km"].sum()
-        total_v_p   = df_km["viagens"].sum()
-        st.caption(f"Total: {total_km_p:,.0f} km  |  {len(df_km)} dias  |  {total_v_p:,} viagens")
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        total_km_p = df_km["km"].sum()
+        total_v_p  = df_km["viagens"].sum()
+        st.caption(f"Total acumulado: {total_km_p:,.0f} km  |  {len(df_km)} dias  |  {total_v_p:,} viagens")
     else:
-        st.info("Sem dados de viagens para o periodo selecionado.")
+        st.markdown('<div class="info-box">Sem dados de viagens para o periodo selecionado.</div>', unsafe_allow_html=True)
 
-    st.markdown("---")
-    col_left, col_right = st.columns(2)
+    st.markdown("<br>", unsafe_allow_html=True)
+    col_left, col_right = st.columns([3, 2])
 
     with col_left:
-        st.markdown('<div class="section-header">VIAGENS POR DIA</div>', unsafe_allow_html=True)
+        st.markdown('<p class="section-label">Viagens por Dia</p>', unsafe_allow_html=True)
         if km_data:
             df_v = pd.DataFrame(km_data)
             df_v["data"] = pd.to_datetime(df_v["data"])
             fig2 = go.Figure(go.Bar(
                 x=df_v["data"], y=df_v["viagens"],
-                marker_color="#8B5CF6",
+                marker_color="#6366F1",
+                marker_line_color="rgba(0,0,0,0)",
+                hovertemplate="<b>%{x|%d/%m/%Y}</b><br>Viagens: %{y}<extra></extra>",
             ))
             fig2.update_layout(
-                paper_bgcolor="#0D1E33", plot_bgcolor="#060F1E",
-                font=dict(color="#F0F6FF", size=11),
-                xaxis=dict(gridcolor="#1A3456", tickformat="%d/%m"),
-                yaxis=dict(gridcolor="#1A3456", title="Viagens"),
-                margin=dict(l=0, r=0, t=10, b=0),
-                height=240, showlegend=False,
+                paper_bgcolor="#FFFFFF", plot_bgcolor="#FAFBFD",
+                font=dict(family="Inter, sans-serif", color="#334155", size=12),
+                xaxis=dict(gridcolor="#E2E8F0", tickformat="%d/%m",
+                           tickfont=dict(color="#94A3B8", size=11), linecolor="#E2E8F0"),
+                yaxis=dict(gridcolor="#E2E8F0", title="Viagens",
+                           tickfont=dict(color="#94A3B8", size=11), linecolor="#E2E8F0"),
+                margin=dict(l=10, r=10, t=16, b=10),
+                height=260, showlegend=False,
+                bargap=0.25,
             )
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
         else:
-            st.info("Sem dados.")
+            st.markdown('<div class="info-box">Sem dados.</div>', unsafe_allow_html=True)
 
     with col_right:
-        st.markdown('<div class="section-header">TOP 10 VEICULOS (KM)</div>', unsafe_allow_html=True)
+        st.markdown('<p class="section-label">Top 10 Veiculos (KM)</p>', unsafe_allow_html=True)
         with st.spinner("Carregando..."):
             top_v = fetch_top_vehicles(days)
         if top_v:
@@ -552,13 +824,12 @@ def page_analytics():
             df_top.columns = ["Placa", "KM", "Litros", "Viagens"]
             df_top["KM"]     = df_top["KM"].apply(lambda x: f"{x:,.1f}")
             df_top["Litros"] = df_top["Litros"].apply(lambda x: f"{x:,.1f}")
-            st.dataframe(df_top, use_container_width=True, hide_index=True, height=240)
+            st.dataframe(df_top, use_container_width=True, hide_index=True, height=260)
         else:
-            st.info("Sem dados.")
+            st.markdown('<div class="info-box">Sem dados.</div>', unsafe_allow_html=True)
 
-    st.markdown("---")
-    st.markdown('<div class="section-header">VIAGENS RECENTES</div>', unsafe_allow_html=True)
-
+    # Trips table
+    st.markdown('<p class="section-label">Viagens Recentes</p>', unsafe_allow_html=True)
     with st.spinner("Carregando viagens..."):
         trips = fetch_recent_trips(50)
 
@@ -577,101 +848,132 @@ def page_analytics():
         for col in ["KM", "Litros", "Vel. Media"]:
             if col in df_t.columns:
                 df_t[col] = pd.to_numeric(df_t[col], errors="coerce").round(1)
-        st.dataframe(df_t, use_container_width=True, hide_index=True, height=400)
+        st.dataframe(df_t, use_container_width=True, hide_index=True, height=380)
     else:
-        st.info("Sem viagens registradas para o periodo selecionado.")
+        st.markdown('<div class="info-box">Sem viagens registradas para o periodo selecionado.</div>', unsafe_allow_html=True)
 
 
 # =================================================================
 #  CONFIGURACOES
 # =================================================================
 def page_config():
-    st.markdown('<div class="section-header">CONFIGURACOES</div>', unsafe_allow_html=True)
+    st.markdown('<p class="page-title">Configuracoes</p>', unsafe_allow_html=True)
+    st.markdown('<p class="page-subtitle">Informacoes de conexao e ferramentas de manutencao.</p>', unsafe_allow_html=True)
 
+    st.markdown('<p class="section-label">Conexao atual</p>', unsafe_allow_html=True)
     url_display = SUPABASE_URL if SUPABASE_URL else "Nao configurado"
-    key_display = ("*" * 8 + SUPABASE_KEY[-6:]) if len(SUPABASE_KEY) > 6 else "Nao configurado"
+    key_display = ("*" * 10 + SUPABASE_KEY[-6:]) if len(SUPABASE_KEY) > 6 else "Nao configurado"
 
-    st.markdown('<div class="info-card">', unsafe_allow_html=True)
-    st.markdown(f"**Supabase URL:** `{url_display}`")
-    st.markdown(f"**Service Key:** `{key_display}`")
-    st.markdown(f"**Usuario Dashboard:** `{DASH_USER}`")
-    st.markdown(f"**Intervalo Padrao:** `{INTERVAL_MIN} min`")
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="card">
+      <table style="width:100%;border-collapse:collapse;font-size:13px;">
+        <tr>
+          <td style="color:#94A3B8;font-weight:600;padding:6px 0;width:180px;">Supabase URL</td>
+          <td style="color:#0F2544;font-weight:500;font-family:monospace;">{url_display}</td>
+        </tr>
+        <tr>
+          <td style="color:#94A3B8;font-weight:600;padding:6px 0;">Service Key</td>
+          <td style="color:#0F2544;font-weight:500;font-family:monospace;">{key_display}</td>
+        </tr>
+        <tr>
+          <td style="color:#94A3B8;font-weight:600;padding:6px 0;">Usuario Dashboard</td>
+          <td style="color:#0F2544;font-weight:500;">{DASH_USER}</td>
+        </tr>
+        <tr>
+          <td style="color:#94A3B8;font-weight:600;padding:6px 0;">Intervalo Padrao</td>
+          <td style="color:#0F2544;font-weight:500;">{INTERVAL_MIN} minutos</td>
+        </tr>
+      </table>
+    </div>
+    """, unsafe_allow_html=True)
 
-    st.markdown("---")
-    st.markdown('<div class="section-header">CONTAGEM DE REGISTROS POR TABELA</div>', unsafe_allow_html=True)
-
-    if st.button("Atualizar Contagens"):
-        with st.spinner("Consultando Supabase..."):
+    st.markdown('<p class="section-label">Contagem de Registros</p>', unsafe_allow_html=True)
+    if st.button("Consultar Supabase"):
+        with st.spinner("Consultando..."):
             counts = fetch_table_counts()
-        df_c = pd.DataFrame([{"Tabela": k, "Registros": v} for k, v in counts.items()])
-        st.dataframe(df_c, use_container_width=True, hide_index=True)
+        rows = [{"Tabela": k, "Registros": v} for k, v in counts.items()]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    st.markdown("---")
-    st.markdown('<div class="section-header">COLETOR — AJUDA</div>', unsafe_allow_html=True)
-    st.code("""# Coleta manual
+    st.markdown('<p class="section-label">Execucao via Linha de Comando</p>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="card" style="background:#F8FAFC;">
+    """, unsafe_allow_html=True)
+    st.code("""# Coleta manual (uma vez)
 python wstt_to_supabase.py
 
-# Modo agendado headless (servidor sem GUI)
+# Modo agendado sem GUI (servidor/VM)
 python scheduler.py
 
 # Periodo especifico
 python wstt_to_supabase.py --ano 2026 --mes 5
 python wstt_to_supabase.py --dias 7
 """, language="bash")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 # =================================================================
 #  EXPORTAR SQL
 # =================================================================
 def page_export():
-    st.markdown('<div class="section-header">EXPORTAR SQL</div>', unsafe_allow_html=True)
-    st.markdown("Baixe o schema das tabelas WSTT para aplicar no Supabase ou migrar para outro banco.")
+    st.markdown('<p class="page-title">Exportar SQL</p>', unsafe_allow_html=True)
+    st.markdown('<p class="page-subtitle">Baixe o schema das tabelas ou exporte dados para CSV / SQL.</p>', unsafe_allow_html=True)
 
     schema_path = ROOT / "supabase_schema.sql"
-    if schema_path.exists():
-        schema_sql = schema_path.read_text(encoding="utf-8")
+    if not schema_path.exists():
+        st.error("Arquivo supabase_schema.sql nao encontrado.")
+        return
+
+    schema_sql = schema_path.read_text(encoding="utf-8")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown('<p class="section-label">Schema das Tabelas</p>', unsafe_allow_html=True)
+        st.markdown("""
+        <div class="card">
+          <p style="font-size:13px;color:#475569;margin-bottom:16px;">
+            DDL completo de todas as tabelas WSTT com constraints UNIQUE necessarias
+            para o UPSERT funcionar corretamente no Supabase.
+          </p>
+        </div>
+        """, unsafe_allow_html=True)
         st.download_button(
             "Baixar Schema SQL",
             data=schema_sql,
             file_name=f"wstt_schema_{datetime.now().strftime('%Y%m%d')}.sql",
             mime="text/plain",
-            use_container_width=False,
+            use_container_width=True,
         )
 
-        st.markdown("---")
-        st.markdown('<div class="section-header">EXPORTAR DADOS DO SUPABASE</div>', unsafe_allow_html=True)
+    with col2:
+        st.markdown('<p class="section-label">Exportar Dados como CSV</p>', unsafe_allow_html=True)
         tables = [
             "wstt_veiculos", "wstt_viagens_telemetria",
             "wstt_eventos_tracker_telemetria", "wstt_execucoes",
         ]
-        sel_table    = st.selectbox("Selecione a tabela", tables)
-        export_limit = st.number_input("Maximo de registros", min_value=100, max_value=50000,
+        sel_table    = st.selectbox("Tabela", tables, label_visibility="collapsed")
+        export_limit = st.number_input("Max. registros", min_value=100, max_value=50000,
                                        value=1000, step=100)
-
-        if st.button("Exportar como CSV"):
-            with st.spinner("Baixando dados..."):
+        if st.button("Gerar CSV", use_container_width=True):
+            with st.spinner("Baixando dados do Supabase..."):
                 data = _req(f"{sel_table}?select=*&limit={export_limit}&order=id.desc")
             if isinstance(data, list) and data:
-                df  = pd.DataFrame(data)
-                csv = df.to_csv(index=False)
+                csv = pd.DataFrame(data).to_csv(index=False)
                 st.download_button(
                     f"Baixar {sel_table}.csv",
                     data=csv,
                     file_name=f"{sel_table}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv",
+                    use_container_width=True,
                 )
-                st.success(f"{len(df)} registros exportados.")
+                st.success(f"{len(data):,} registros exportados.")
             elif isinstance(data, dict) and "erro" in data:
                 st.error(f"Erro: {data['erro']}")
             else:
                 st.warning("Nenhum dado encontrado.")
 
-        st.markdown("---")
-        with st.expander("Visualizar Schema SQL"):
-            st.code(schema_sql, language="sql")
-    else:
-        st.warning("Arquivo supabase_schema.sql nao encontrado.")
+    st.markdown('<p class="section-label">Visualizar Schema</p>', unsafe_allow_html=True)
+    with st.expander("Expandir schema SQL completo"):
+        st.code(schema_sql, language="sql")
 
 
 # =================================================================
@@ -681,9 +983,7 @@ def main():
     if not st.session_state["authenticated"]:
         login_page()
         return
-
     nav = sidebar()
-
     if nav == "Painel":
         page_painel()
     elif nav == "Analytics":
